@@ -1,0 +1,25 @@
+v=0
+o=- 46117319 2 IN IP4 127.0.0.1
+s=SampleOffer
+t=0 0
+a=group:BUNDLE 0
+a=msid-semantic: WMS webrtcsample
+m=video 9 UDP/TLS/RTP/SAVPF 96
+c=IN IP4 0.0.0.0
+a=rtcp:9 IN IP4 0.0.0.0
+a=ice-ufrag:sampleUfrag
+a=ice-pwd:samplePwd1234567890123456789012
+a=ice-options:trickle
+a=fingerprint:sha-256 9A:59:9C:7F:30:58:1F:91:31:45:7B:E3:8A:E6:65:D3:58:33:7B:48:7E:72:E5:65:74:28:EF:5E:DC:A9:3C:F6
+a=setup:actpass
+a=mid:0
+a=sendrecv
+a=rtcp-mux
+a=rtcp-rsize
+a=rtpmap:96 VP8/90000
+a=fmtp:96 max-fs=12288;max-fr=60
+a=ssrc:12345678 cname:sampleCname
+a=ssrc:12345678 msid:sampleStream sampleTrack
+a=ssrc:12345678 mslabel:sampleStream
+a=ssrc:12345678 label:sampleTrack
+a=msid:sampleStream sampleTrack
