@@ -233,11 +233,37 @@ class Program
     private static FFmpegVideoEndPoint CreateVideoEndPoint()
     {
         var endPoint = new FFmpegVideoEndPoint();
-        endPoint.RestrictFormats(format => format.Codec == VideoCodecsEnum.VP8);
+        var codec = GetVideoCodec();
+        endPoint.RestrictFormats(format => format.Codec == codec);
 
         AttachVideoFrameHandlers(endPoint);
 
         return endPoint;
+    }
+
+    private static VideoCodecsEnum GetVideoCodec()
+    {
+        var codecEnv = Environment.GetEnvironmentVariable("WEBRTC_VIDEO_CODEC");
+        logger.LogInformation(
+            "WEBRTC_VIDEO_CODEC environment variable: {CodecEnv}",
+            codecEnv ?? "(not set)"
+        );
+
+        if (string.IsNullOrEmpty(codecEnv))
+        {
+            logger.LogInformation("Using default codec: H264");
+            return VideoCodecsEnum.H264;
+        }
+
+        var codec = codecEnv.ToUpperInvariant() switch
+        {
+            "VP8" => VideoCodecsEnum.VP8,
+            "H264" => VideoCodecsEnum.H264,
+            _ => VideoCodecsEnum.H264,
+        };
+
+        logger.LogInformation("Selected codec: {Codec}", codec);
+        return codec;
     }
 
     private static void AttachVideoFrameHandlers(FFmpegVideoEndPoint endPoint)

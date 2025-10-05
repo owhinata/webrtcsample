@@ -1,0 +1,16 @@
+{
+  "profiles": {
+    "Client (H264)": {
+      "commandName": "Project",
+      "environmentVariables": {
+        "WEBRTC_VIDEO_CODEC": "H264"
+      }
+    },
+    "Client (VP8)": {
+      "commandName": "Project",
+      "environmentVariables": {
+        "WEBRTC_VIDEO_CODEC": "VP8"
+      }
+    }
+  }
+}

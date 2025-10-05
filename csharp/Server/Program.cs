@@ -154,12 +154,19 @@ class Program
                 Mp4Path
             );
             var fileSource = new FFmpegFileSource(Mp4Path, true, new AudioEncoder());
-            fileSource.RestrictFormats(format => format.Codec == VideoCodecsEnum.VP8);
+            fileSource.RestrictFormats(format =>
+                format.Codec == VideoCodecsEnum.H264
+                || format.Codec == VideoCodecsEnum.VP8
+            );
             return fileSource;
         }
 
         _logger.LogInformation("MP4 file not found, using test pattern source.");
         var testPatternSource = new VideoTestPatternSource(new FFmpegVideoEncoder());
+        testPatternSource.RestrictFormats(format =>
+            format.Codec == VideoCodecsEnum.H264
+            || format.Codec == VideoCodecsEnum.VP8
+        );
         testPatternSource.SetFrameRate(TEST_PATTERN_FRAMES_PER_SECOND);
         testPatternSource.OnVideoSourceRawSample += MeasureTestPatternSourceFrameRate;
         return testPatternSource;
