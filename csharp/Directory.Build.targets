@@ -1,0 +1,18 @@
+<Project>
+  <PropertyGroup>
+    <RunCsharpierOnBuild Condition="'$(RunCsharpierOnBuild)' == ''"
+      >true</RunCsharpierOnBuild
+    >
+  </PropertyGroup>
+  <Target
+    Name="FormatWithCSharpier"
+    BeforeTargets="CoreCompile"
+    Condition="'$(RunCsharpierOnBuild)' != 'false'"
+  >
+    <Message Text="Running csharpier formatter..." Importance="High" />
+    <Exec
+      Command="csharpier format &quot;$(MSBuildProjectDirectory)&quot;"
+      WorkingDirectory="$(MSBuildProjectDirectory)"
+    />
+  </Target>
+</Project>
