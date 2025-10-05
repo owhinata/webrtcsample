@@ -1,10 +1,10 @@
 using System;
+using System.Linq;
 using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Linq;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using OpenCvSharp;
@@ -22,9 +22,12 @@ class Program
 {
     private const string DefaultOfferUrl = "https://localhost:5443/offer";
     private const string WindowName = "WebRTC Client";
+    private const int DisplayIntervalMs = 15;
+
+    // Example: @"C:\\ffmpeg-7.1.1-full_build-shared\\bin";
+    private const string? ffmpegLibFullPath = null;
 
     private static readonly object FrameSync = new();
-    private const string? ffmpegLibFullPath = null; // @"C:\\ffmpeg-7.1.1-full_build-shared\\bin";
 
     private static ILogger logger = NullLogger.Instance;
     private static Mat? latestFrame;
@@ -34,51 +37,106 @@ class Program
 
     static async Task Main(string[] args)
     {
-        logger = AddConsoleLogger();
+        await RunAsync().ConfigureAwait(false);
+    }
 
+    private static async Task RunAsync()
+    {
+        logger = AddConsoleLogger();
         FFmpegInit.Initialise(null, ffmpegLibFullPath, logger);
 
-        var offerUrl = Environment.GetEnvironmentVariable("WEBRTC_OFFER_URL") ?? DefaultOfferUrl;
+        var offerUrl = GetOfferUrl();
 
         using var peerConnection = await CreatePeerConnection().ConfigureAwait(false);
+        var offerCompleted = await TryCompleteOfferAnswerAsync(
+                peerConnection,
+                offerUrl
+            )
+            .ConfigureAwait(false);
 
+        if (!offerCompleted)
+        {
+            return;
+        }
+
+        Cv2.NamedWindow(WindowName, WindowFlags.AutoSize);
+
+        using var exitCts = new CancellationTokenSource();
+        var shutdownTcs = CreateShutdownSignal(exitCts, peerConnection);
+
+        RunDisplayLoop(exitCts, shutdownTcs);
+        await shutdownTcs.Task.ConfigureAwait(false);
+
+        await CloseVideoSinkAsync().ConfigureAwait(false);
+        ResetFrameState();
+        Cv2.DestroyAllWindows();
+
+        logger.LogInformation("Client exiting.");
+    }
+
+    private static string GetOfferUrl() =>
+        Environment.GetEnvironmentVariable("WEBRTC_OFFER_URL") ?? DefaultOfferUrl;
+
+    private static async Task<bool> TryCompleteOfferAnswerAsync(
+        RTCPeerConnection peerConnection,
+        string offerUrl
+    )
+    {
         var offer = peerConnection.createOffer();
         await peerConnection.setLocalDescription(offer).ConfigureAwait(false);
 
         using var http = new HttpClient();
-        var request = new StringContent(offer.sdp ?? string.Empty, Encoding.UTF8, "application/sdp");
+        var request = new StringContent(
+            offer.sdp ?? string.Empty,
+            Encoding.UTF8,
+            "application/sdp"
+        );
 
         logger.LogInformation("Posting SDP offer to {OfferUrl}.", offerUrl);
         var response = await http.PostAsync(offerUrl, request).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
         {
-            logger.LogError("Server returned failure status {StatusCode}", response.StatusCode);
-            return;
+            logger.LogError(
+                "Server returned failure status {StatusCode}",
+                response.StatusCode
+            );
+            return false;
         }
 
-        var answerSdp = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+        var answerSdp = await response
+            .Content.ReadAsStringAsync()
+            .ConfigureAwait(false);
         logger.LogInformation("Received SDP answer:\n{Sdp}", answerSdp);
 
         var sdp = SDP.ParseSDPDescription(answerSdp);
         if (sdp == null)
         {
             logger.LogError("Failed to parse SDP answer.");
-            return;
+            return false;
         }
 
         var setResult = peerConnection.SetRemoteDescription(SdpType.answer, sdp);
         if (setResult != SetDescriptionResultEnum.OK)
         {
             logger.LogError("Failed to set remote description: {Result}.", setResult);
-            return;
+            return false;
         }
 
-        logger.LogInformation("Remote description applied. ICE negotiation in progress.");
+        logger.LogInformation(
+            "Remote description applied. ICE negotiation in progress."
+        );
 
-        Cv2.NamedWindow(WindowName, WindowFlags.AutoSize);
+        return true;
+    }
 
-        using var exitCts = new CancellationTokenSource();
-        var shutdownTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    private static TaskCompletionSource CreateShutdownSignal(
+        CancellationTokenSource exitCts,
+        RTCPeerConnection peerConnection
+    )
+    {
+        var shutdownTcs = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously
+        );
 
         Console.CancelKeyPress += (_, e) =>
         {
@@ -90,7 +148,10 @@ class Program
         peerConnection.onconnectionstatechange += state =>
         {
             logger.LogDebug("Peer connection state changed to {State}.", state);
-            if (state == RTCPeerConnectionState.failed || state == RTCPeerConnectionState.closed)
+            if (
+                state == RTCPeerConnectionState.failed
+                || state == RTCPeerConnectionState.closed
+            )
             {
                 shutdownTcs.TrySetResult();
             }
@@ -101,124 +162,204 @@ class Program
             logger.LogDebug("ICE connection state changed to {State}.", state);
         };
 
-        try
+        return shutdownTcs;
+    }
+
+    private static void RunDisplayLoop(
+        CancellationTokenSource exitCts,
+        TaskCompletionSource shutdownTcs
+    )
+    {
+        while (!exitCts.IsCancellationRequested)
         {
-            while (!exitCts.IsCancellationRequested)
+            if (shutdownTcs.Task.IsCompleted)
             {
-                if (shutdownTcs.Task.IsCompleted)
+                exitCts.Cancel();
+                break;
+            }
+
+            using var frameToShow = DequeueFrame();
+            if (frameToShow != null)
+            {
+                Cv2.ImShow(WindowName, frameToShow);
+
+                if (!firstFrameLogged)
                 {
-                    exitCts.Cancel();
-                    break;
-                }
-
-                Mat? frameToShow = null;
-
-                lock (FrameSync)
-                {
-                    if (framePending && latestFrame != null)
-                    {
-                        frameToShow = latestFrame.Clone();
-                        framePending = false;
-                    }
-                }
-
-                if (frameToShow != null)
-                {
-                    Cv2.ImShow(WindowName, frameToShow);
-                    frameToShow.Dispose();
-
-                    if (!firstFrameLogged)
-                    {
-                        logger.LogInformation("Displaying first frame.");
-                        firstFrameLogged = true;
-                    }
-                }
-
-                var key = Cv2.WaitKey(10);
-                if (key == 27 || key == 'q')
-                {
-                    shutdownTcs.TrySetResult();
-                    exitCts.Cancel();
+                    logger.LogInformation("Displaying first frame.");
+                    firstFrameLogged = true;
                 }
             }
 
-            await shutdownTcs.Task.ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            // Expected on shutdown.
-        }
+            var key = Cv2.WaitKey(DisplayIntervalMs);
+            if (IsExitKey(key))
+            {
+                shutdownTcs.TrySetResult();
+                exitCts.Cancel();
+                break;
+            }
 
-        if (videoEndPoint != null)
-        {
-            await videoEndPoint.CloseVideoSink().ConfigureAwait(false);
+            Thread.Sleep(DisplayIntervalMs);
         }
+    }
 
+    private static Mat? DequeueFrame()
+    {
         lock (FrameSync)
         {
-            latestFrame?.Dispose();
-            latestFrame = null;
+            if (!framePending || latestFrame == null)
+            {
+                return null;
+            }
+
             framePending = false;
+            return latestFrame.Clone();
         }
-
-        Cv2.DestroyAllWindows();
-
-        logger.LogInformation("Client exiting.");
     }
+
+    private static bool IsExitKey(int key) => key is 27 or 'q' or 'Q';
 
     private static async Task<RTCPeerConnection> CreatePeerConnection()
     {
         var peerConnection = new RTCPeerConnection();
 
-        videoEndPoint = new FFmpegVideoEndPoint();
-        videoEndPoint.RestrictFormats(format => format.Codec == VideoCodecsEnum.VP8);
-
-        videoEndPoint.OnVideoSinkDecodedSampleFaster += rawImage =>
-        {
-            logger.LogDebug("Decoded fast frame format={Format} {Width}x{Height} stride={Stride}.", rawImage.PixelFormat, rawImage.Width, rawImage.Height, rawImage.Stride);
-            var (buffer, width, height, matType, conversion) = ConvertRawImage(rawImage);
-            if (buffer != null)
-            {
-                UpdateFrame(buffer, width, height, matType, conversion);
-            }
-        };
-
-        videoEndPoint.OnVideoSinkDecodedSample += (byte[] buffer, uint width, uint height, int stride, VideoPixelFormatsEnum pixelFormat) =>
-        {
-            if (pixelFormat == VideoPixelFormatsEnum.Rgb)
-            {
-                logger.LogDebug("Decoded RGB frame {Width}x{Height} stride={Stride}.", width, height, stride);
-                UpdateFrame(buffer, (int)width, (int)height, MatType.CV_8UC3, ColorConversionCodes.RGB2BGR);
-            }
-            else if (pixelFormat == VideoPixelFormatsEnum.Bgr)
-            {
-                logger.LogDebug("Decoded BGR frame {Width}x{Height} stride={Stride}.", width, height, stride);
-                UpdateFrame(buffer, (int)width, (int)height, MatType.CV_8UC3, null);
-            }
-            else
-            {
-                logger.LogWarning("Unhandled decoded sample pixel format {PixelFormat} (stride={Stride}).", pixelFormat, stride);
-            }
-        };
-
-        MediaStreamTrack videoTrack = new(videoEndPoint.GetVideoSinkFormats(), MediaStreamStatusEnum.RecvOnly);
-        peerConnection.addTrack(videoTrack);
-
-        peerConnection.OnVideoFormatsNegotiated += formats =>
-        {
-            var format = formats.First();
-            videoEndPoint.SetVideoSinkFormat(format);
-            logger.LogInformation("Negotiated video format {FormatId}:{Codec}.", format.FormatID, format.Codec);
-        };
-
-        peerConnection.OnVideoFrameReceived += videoEndPoint.GotVideoFrame;
+        videoEndPoint = CreateVideoEndPoint();
+        ConfigureVideoPipeline(peerConnection, videoEndPoint);
 
         await videoEndPoint.StartVideoSink().ConfigureAwait(false);
 
         return peerConnection;
     }
 
-    private static (byte[]? buffer, int width, int height, MatType matType, ColorConversionCodes? conversion) ConvertRawImage(RawImage rawImage)
+    private static FFmpegVideoEndPoint CreateVideoEndPoint()
+    {
+        var endPoint = new FFmpegVideoEndPoint();
+        endPoint.RestrictFormats(format => format.Codec == VideoCodecsEnum.VP8);
+
+        AttachVideoFrameHandlers(endPoint);
+
+        return endPoint;
+    }
+
+    private static void AttachVideoFrameHandlers(FFmpegVideoEndPoint endPoint)
+    {
+        endPoint.OnVideoSinkDecodedSampleFaster += ProcessFastDecodedSample;
+        endPoint.OnVideoSinkDecodedSample += ProcessDecodedSample;
+    }
+
+    private static void ProcessFastDecodedSample(RawImage rawImage)
+    {
+        logger.LogDebug(
+            "Decoded fast frame format={Format} {Width}x{Height} stride={Stride}.",
+            rawImage.PixelFormat,
+            rawImage.Width,
+            rawImage.Height,
+            rawImage.Stride
+        );
+
+        var (buffer, width, height, matType, conversion) = ConvertRawImage(rawImage);
+        if (buffer != null)
+        {
+            UpdateFrame(buffer, width, height, matType, conversion);
+        }
+    }
+
+    private static void ProcessDecodedSample(
+        byte[] buffer,
+        uint width,
+        uint height,
+        int stride,
+        VideoPixelFormatsEnum pixelFormat
+    )
+    {
+        switch (pixelFormat)
+        {
+            case VideoPixelFormatsEnum.Rgb:
+                logger.LogDebug(
+                    "Decoded RGB frame {Width}x{Height} stride={Stride}.",
+                    width,
+                    height,
+                    stride
+                );
+                UpdateFrame(
+                    buffer,
+                    (int)width,
+                    (int)height,
+                    MatType.CV_8UC3,
+                    ColorConversionCodes.RGB2BGR
+                );
+                break;
+
+            case VideoPixelFormatsEnum.Bgr:
+                logger.LogDebug(
+                    "Decoded BGR frame {Width}x{Height} stride={Stride}.",
+                    width,
+                    height,
+                    stride
+                );
+                UpdateFrame(buffer, (int)width, (int)height, MatType.CV_8UC3, null);
+                break;
+
+            default:
+                logger.LogWarning(
+                    "Unhandled decoded sample pixel format {PixelFormat} (stride={Stride}).",
+                    pixelFormat,
+                    stride
+                );
+                break;
+        }
+    }
+
+    private static void ConfigureVideoPipeline(
+        RTCPeerConnection peerConnection,
+        FFmpegVideoEndPoint endPoint
+    )
+    {
+        MediaStreamTrack videoTrack = new(
+            endPoint.GetVideoSinkFormats(),
+            MediaStreamStatusEnum.RecvOnly
+        );
+        peerConnection.addTrack(videoTrack);
+
+        peerConnection.OnVideoFormatsNegotiated += formats =>
+        {
+            var format = formats.First();
+            endPoint.SetVideoSinkFormat(format);
+            logger.LogInformation(
+                "Negotiated video format {FormatId}:{Codec}.",
+                format.FormatID,
+                format.Codec
+            );
+        };
+
+        peerConnection.OnVideoFrameReceived += endPoint.GotVideoFrame;
+    }
+
+    private static async Task CloseVideoSinkAsync()
+    {
+        if (videoEndPoint != null)
+        {
+            await videoEndPoint.CloseVideoSink().ConfigureAwait(false);
+        }
+    }
+
+    private static void ResetFrameState()
+    {
+        lock (FrameSync)
+        {
+            latestFrame?.Dispose();
+            latestFrame = null;
+            framePending = false;
+            firstFrameLogged = false;
+        }
+    }
+
+    private static (
+        byte[]? buffer,
+        int width,
+        int height,
+        MatType matType,
+        ColorConversionCodes? conversion
+    ) ConvertRawImage(RawImage rawImage)
     {
         try
         {
@@ -272,7 +413,12 @@ class Program
     {
         try
         {
-            using var yuv = Mat.FromPixelData(height + height / 2, width, MatType.CV_8UC1, buffer);
+            using var yuv = Mat.FromPixelData(
+                height + height / 2,
+                width,
+                MatType.CV_8UC1,
+                buffer
+            );
             using var bgr = new Mat();
             Cv2.CvtColor(yuv, bgr, ColorConversionCodes.YUV2BGR_I420);
             var output = new byte[width * height * 3];
@@ -288,11 +434,21 @@ class Program
 
     private static byte[]? LogUnhandled(VideoPixelFormatsEnum pixelFormat, int stride)
     {
-        logger.LogWarning("Unhandled raw image pixel format {PixelFormat} (stride={Stride}).", pixelFormat, stride);
+        logger.LogWarning(
+            "Unhandled raw image pixel format {PixelFormat} (stride={Stride}).",
+            pixelFormat,
+            stride
+        );
         return null;
     }
 
-    private static void UpdateFrame(byte[] buffer, int width, int height, MatType matType, ColorConversionCodes? conversion)
+    private static void UpdateFrame(
+        byte[] buffer,
+        int width,
+        int height,
+        MatType matType,
+        ColorConversionCodes? conversion
+    )
     {
         try
         {
