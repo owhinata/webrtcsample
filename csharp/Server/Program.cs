@@ -1,411 +1,191 @@
 using System;
-using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Text;
-using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using Serilog;
+using Serilog.Extensions.Logging;
+using SIPSorceryMedia.Abstractions;
 using SIPSorcery.Media;
 using SIPSorcery.Net;
-using SIPSorceryMedia.Abstractions;
-using SIPSorceryMedia.Encoders;
 using SIPSorceryMedia.FFmpeg;
 
-var builder = WebApplication.CreateBuilder(args);
+namespace Server;
 
-builder.Logging.ClearProviders();
-builder.Logging.AddSimpleConsole(options =>
+class Program
 {
-    options.SingleLine = true;
-    options.TimestampFormat = "HH:mm:ss ";
-});
+    private const string ffmpegLibFullPath = null; //@"C:\ffmpeg-7.1.1-full_build-shared\bin";
 
-var app = builder.Build();
+    private const string STUN_URL = "stun:stun.cloudflare.com";
+    private const int TEST_PATTERN_FRAMES_PER_SECOND = 30;
 
-var ffmpegRuntime = new FfmpegRuntime(app.Logger);
-if (!ffmpegRuntime.EnsureInitialised(out var initMessage))
-{
-    app.Logger.LogWarning("FFmpeg initialisation deferred: {Message}", initMessage);
-}
+    private static Microsoft.Extensions.Logging.ILogger _logger = NullLogger.Instance;
 
-app.MapGet("/health", () => Results.Text("ok", "text/plain", Encoding.UTF8));
-app.MapPost("/offer", (Func<HttpContext, Task<IResult>>)(context => HandleOfferAsync(context, ffmpegRuntime, app.Logger)));
+    private static int _frameCount = 0;
+    private static DateTime _startTime;
 
-app.Run("http://127.0.0.1:8080");
-static async Task<IResult> HandleOfferAsync(HttpContext context, FfmpegRuntime ffmpegRuntime, ILogger logger)
-{
-    var sessionId = Guid.NewGuid().ToString();
-    logger.LogInformation("Received offer for session {SessionId}", sessionId);
-
-    if (!ffmpegRuntime.EnsureInitialised(out var ffmpegError))
+    static async Task Main(string[] args)
     {
-        logger.LogError("FFmpeg initialisation failed: {Message}", ffmpegError);
-        return Results.Problem(detail: ffmpegError, statusCode: StatusCodes.Status500InternalServerError, title: "FFmpeg initialisation failed");
+        Log.Logger = new LoggerConfiguration()
+        .MinimumLevel.Debug()
+        .Enrich.FromLogContext()
+        .WriteTo.Console()
+        .CreateLogger();
+
+        Log.Information("WebRTC Test Pattern Server Demo");
+
+        var factory = new SerilogLoggerFactory(Log.Logger);
+        SIPSorcery.LogFactory.Set(factory);
+        _logger = factory.CreateLogger<Program>();
+
+        var builder = WebApplication.CreateBuilder();
+
+        builder.Host.UseSerilog();
+
+        builder.Services.AddLogging(builder =>
+        {
+            builder.AddSerilog(dispose: true);
+        });
+
+        var app = builder.Build();
+
+        app.UseDefaultFiles();
+        app.UseStaticFiles();
+
+        app.MapPost("/offer", async (HttpRequest request) =>
+        {
+            string sdpOffer;
+            using (var reader = new StreamReader(request.Body))
+            {
+                sdpOffer = await reader.ReadToEndAsync().ConfigureAwait(false);
+            }
+
+            _logger.LogInformation("Received SDP Offer:\n{Sdp}", sdpOffer);
+
+            var pc = await CreatePeerConnection();
+
+            var result = pc.setRemoteDescription(new RTCSessionDescriptionInit { sdp = sdpOffer, type = RTCSdpType.offer });
+
+            if(result == SetDescriptionResultEnum.OK)
+            {
+                var answerSdp = pc.createAnswer();
+
+                await pc.setLocalDescription(answerSdp);
+
+                _logger.LogInformation("Returning answer SDP:\n{Sdp}", answerSdp.sdp);
+
+                return Results.Text(pc.localDescription.sdp.ToString());
+            }
+            else
+            {
+                _logger.LogError("Failed to set remote description: {Result}", result);
+                return Results.BadRequest(result.ToString());
+            }
+        });
+
+        await app.RunAsync();
     }
 
-    string offerSdp;
-    using (var reader = new StreamReader(context.Request.Body, Encoding.UTF8, detectEncodingFromByteOrderMarks: false, bufferSize: 1024, leaveOpen: true))
+    private static Task<RTCPeerConnection> CreatePeerConnection()
     {
-        offerSdp = await reader.ReadToEndAsync().ConfigureAwait(false);
-    }
+        var pc = new RTCPeerConnection(null);
 
-    if (string.IsNullOrWhiteSpace(offerSdp))
-    {
-        const string message = "SDP offer body was empty.";
-        logger.LogWarning(message);
-        return Results.Problem(detail: message, statusCode: StatusCodes.Status400BadRequest, title: "Invalid offer");
-    }
+        SIPSorceryMedia.FFmpeg.FFmpegInit.Initialise(SIPSorceryMedia.FFmpeg.FfmpegLogLevelEnum.AV_LOG_VERBOSE, ffmpegLibFullPath, _logger);
+        var testPatternSource = new VideoTestPatternSource(new FFmpegVideoEncoder());
+        testPatternSource.SetFrameRate(TEST_PATTERN_FRAMES_PER_SECOND);
 
-    if (!TryResolveVideoPath(out var videoPath, out var videoError))
-    {
-        logger.LogError("Video path resolution failed: {Message}", videoError);
-        return Results.Problem(detail: videoError, statusCode: StatusCodes.Status500InternalServerError, title: "Video file not found");
-    }
-
-    RTCPeerConnection? pc = null;
-    FFmpegFileSource? source = null;
-    EncodedSampleDelegate? encodedHandler = null;
-    SourceErrorDelegate? errorHandler = null;
-    var cleanupState = 0;
-
-    async Task CleanupAsync(string reason)
-    {
-        if (Interlocked.Exchange(ref cleanupState, 1) != 0)
-        {
-            return;
-        }
-
-        logger.LogInformation("Cleaning up session {SessionId}: {Reason}", sessionId, reason);
-
-        if (source != null)
-        {
-            if (encodedHandler != null)
-            {
-                source.OnVideoSourceEncodedSample -= encodedHandler;
-            }
-
-            if (errorHandler != null)
-            {
-                source.OnVideoSourceError -= errorHandler;
-            }
-
-            try
-            {
-                await source.CloseVideo().ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                logger.LogDebug(ex, "CloseVideo threw for session {SessionId}", sessionId);
-            }
-
-            try
-            {
-                await source.Close().ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                logger.LogDebug(ex, "Close threw for session {SessionId}", sessionId);
-            }
-
-            source.Dispose();
-        }
-
-        pc?.Close(reason);
-    }
-
-    try
-    {
-        logger.LogInformation("Initialising FFmpeg source for {VideoPath}", videoPath);
-
-        // Create source WITHOUT setting format to get raw samples
-        source = new FFmpegFileSource(videoPath, true, null, 0, true);
-
-        var availableFormats = source.GetVideoSourceFormats();
-        if (availableFormats == null || availableFormats.Count == 0)
-        {
-            const string message = "FFmpeg source returned no video formats.";
-            logger.LogError(message);
-            await CleanupAsync("no-formats").ConfigureAwait(false);
-            return Results.Problem(detail: message, statusCode: StatusCodes.Status500InternalServerError, title: "FFmpeg error");
-        }
-
-        logger.LogInformation("Available formats ({SessionId}): {Formats}", sessionId, string.Join(", ", availableFormats.Select(f => f.Codec)));
-
-        // Use VP8 format directly from FFmpeg (it has built-in VP8 encoder)
-        var vp8Format = availableFormats.First(f => f.Codec == VideoCodecsEnum.VP8);
-        source.SetVideoSourceFormat(vp8Format);
-        logger.LogInformation("Set VP8 format from source ({SessionId})", sessionId);
-
-        var vp8OutputFormat = new VideoFormat(VideoCodecsEnum.VP8, 96, 90000, null);
-
-        pc = new RTCPeerConnection(new RTCConfiguration { iceServers = null });
-
-        pc.onicecandidate += candidate =>
-        {
-            if (candidate != null)
-            {
-                logger.LogInformation("ICE candidate ({SessionId}): {Candidate}", sessionId, candidate.candidate);
-            }
-        };
-
-        pc.oniceconnectionstatechange += state =>
-        {
-            logger.LogInformation("ICE state ({SessionId}): {State}", sessionId, state);
-        };
-
-        var videoStarted = false;
-        pc.onconnectionstatechange += state =>
-        {
-            logger.LogInformation("Peer state {SessionId}: {State}", sessionId, state);
-            if (state == RTCPeerConnectionState.connected && !videoStarted)
-            {
-                videoStarted = true;
-                // Start video when connection is established
-                _ = Task.Run(async () =>
-                {
-                    try
-                    {
-                        // Add a small delay to ensure connection is fully established
-                        await Task.Delay(100).ConfigureAwait(false);
-                        logger.LogInformation("Starting FFmpeg video source ({SessionId})", sessionId);
-                        await source.StartVideo().ConfigureAwait(false);
-                        logger.LogInformation("FFmpeg source completed for session {SessionId}", sessionId);
-                    }
-                    catch (Exception ex)
-                    {
-                        logger.LogError(ex, "FFmpeg source failed for session {SessionId}", sessionId);
-                    }
-                    finally
-                    {
-                        await CleanupAsync("video-source-stopped").ConfigureAwait(false);
-                    }
-                });
-            }
-            else if (state is RTCPeerConnectionState.failed or RTCPeerConnectionState.disconnected or RTCPeerConnectionState.closed)
-            {
-                _ = CleanupAsync($"pc-{state}");
-            }
-        };
-
-        pc.OnVideoFormatsNegotiated += formats =>
-        {
-            logger.LogInformation("Negotiated formats ({SessionId}): {Formats}", sessionId, string.Join(", ", formats.Select(f => f.FormatID)));
-        };
-
-        var track = new MediaStreamTrack(new List<VideoFormat> { vp8OutputFormat }, MediaStreamStatusEnum.SendOnly);
+        MediaStreamTrack track = new MediaStreamTrack(testPatternSource.GetVideoSourceFormats(), MediaStreamStatusEnum.SendOnly);
         pc.addTrack(track);
 
-        // Handle encoded VP8 samples from FFmpeg
-        encodedHandler = (duration, sample) =>
+        //testPatternSource.OnVideoSourceRawSample += videoEndPoint.ExternalVideoSourceRawSample;
+        testPatternSource.OnVideoSourceRawSample += MesasureTestPatternSourceFrameRate;
+        testPatternSource.OnVideoSourceEncodedSample += pc.SendVideo;
+        pc.OnVideoFormatsNegotiated += (formats) => testPatternSource.SetVideoSourceFormat(formats.First());
+
+        AudioExtrasSource audioSource = new AudioExtrasSource(new AudioEncoder(includeOpus: false), new AudioSourceOptions { AudioSource = AudioSourcesEnum.Music });
+        audioSource.OnAudioSourceEncodedSample += pc.SendAudio;
+
+        MediaStreamTrack audioTrack = new MediaStreamTrack(audioSource.GetAudioSourceFormats(), MediaStreamStatusEnum.SendOnly);
+        pc.addTrack(audioTrack);
+        pc.OnAudioFormatsNegotiated += (audioFormats) => audioSource.SetAudioSourceFormat(audioFormats.First());
+
+        pc.onconnectionstatechange += async (state) =>
         {
-            if (sample == null || sample.Length == 0)
+            _logger.LogDebug($"Peer connection state change to {state}.");
+
+            if (state == RTCPeerConnectionState.failed)
             {
-                return;
+                pc.Close("ice disconnection");
             }
-
-            pc.SendVideo(duration, sample);
-            logger.LogInformation("Sent VP8 sample ({SessionId}) length={Length} duration={Duration}", sessionId, sample.Length, duration);
-        };
-        source.OnVideoSourceEncodedSample += encodedHandler;
-        logger.LogInformation("Registered OnVideoSourceEncodedSample handler ({SessionId})", sessionId);
-
-        errorHandler = message => logger.LogError("FFmpeg source error ({SessionId}): {Message}", sessionId, message);
-        source.OnVideoSourceError += errorHandler;
-
-        var remoteDescription = new RTCSessionDescriptionInit
-        {
-            type = RTCSdpType.offer,
-            sdp = offerSdp
-        };
-
-        var remoteResult = pc.setRemoteDescription(remoteDescription);
-        if (remoteResult != SetDescriptionResultEnum.OK)
-        {
-            logger.LogError("Failed to set remote description: {Result}", remoteResult);
-            await CleanupAsync("set-remote-failed").ConfigureAwait(false);
-            return Results.Problem(detail: $"Failed to set remote description: {remoteResult}", statusCode: StatusCodes.Status500InternalServerError, title: "SDP failure");
-        }
-
-        var answer = pc.createAnswer(new RTCAnswerOptions());
-        await pc.setLocalDescription(answer).ConfigureAwait(false);
-
-        var answerSdp = answer.sdp ?? string.Empty;
-        logger.LogInformation("Returning answer for session {SessionId} with length {Length}", sessionId, answerSdp.Length);
-        return Results.Text(answerSdp, "application/sdp", Encoding.UTF8);
-    }
-    catch (Exception ex)
-    {
-        logger.LogError(ex, "Unhandled exception for session {SessionId}", sessionId);
-        await CleanupAsync("exception").ConfigureAwait(false);
-        return Results.Problem(detail: ex.Message, statusCode: StatusCodes.Status500InternalServerError, title: "Offer handling failed");
-    }
-}
-static bool TryResolveVideoPath(out string fullPath, out string? error)
-{
-    var envPath = Environment.GetEnvironmentVariable("WEBRTC_FILE");
-    var candidate = string.IsNullOrWhiteSpace(envPath) ? "sample.mp4" : envPath.Trim();
-    candidate = Environment.ExpandEnvironmentVariables(candidate);
-
-    if (Path.IsPathRooted(candidate))
-    {
-        if (File.Exists(candidate))
-        {
-            fullPath = candidate;
-            error = null;
-            return true;
-        }
-
-        fullPath = string.Empty;
-        error = $"Video file not found at {candidate}";
-        return false;
-    }
-
-    var roots = new[]
-    {
-        Directory.GetCurrentDirectory(),
-        AppContext.BaseDirectory,
-        Path.Combine(AppContext.BaseDirectory, ".."),
-        Path.Combine(AppContext.BaseDirectory, "..", ".."),
-        Path.Combine(AppContext.BaseDirectory, "..", "..", "..")
-    };
-
-    foreach (var root in roots)
-    {
-        try
-        {
-            var probe = Path.GetFullPath(candidate, root);
-            if (File.Exists(probe))
+            else if (state == RTCPeerConnectionState.closed)
             {
-                fullPath = probe;
-                error = null;
-                return true;
+                await audioSource.CloseAudio();
+                await testPatternSource.CloseVideo();
+                testPatternSource.Dispose();
             }
-        }
-        catch (Exception)
-        {
-        }
-    }
-
-    fullPath = string.Empty;
-    error = $"Video file '{candidate}' was not found. Set WEBRTC_FILE to a valid mp4.";
-    return false;
-}
-sealed class FfmpegRuntime
-{
-    private readonly ILogger _logger;
-    private int _initialised;
-
-    public FfmpegRuntime(ILogger logger)
-    {
-        _logger = logger;
-    }
-
-    public bool EnsureInitialised(out string? error)
-    {
-        if (Volatile.Read(ref _initialised) == 1)
-        {
-            error = null;
-            return true;
-        }
-
-        var libPath = ResolveCandidatePath();
-        if (libPath == null)
-        {
-            error = "Unable to locate FFmpeg shared libraries. Set WEBRTC_FFMPEG_DIR or add binaries to PATH.";
-            return false;
-        }
-
-        try
-        {
-            FFmpegInit.Initialise(null, libPath, _logger);
-            Interlocked.Exchange(ref _initialised, 1);
-            _logger.LogInformation("Initialised FFmpeg binaries from {Path}", libPath);
-            error = null;
-            return true;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "FFmpeg initialisation failed for path {Path}", libPath);
-            error = ex.Message;
-            return false;
-        }
-    }
-
-    private static string? ResolveCandidatePath()
-    {
-        var envCandidates = new[]
-        {
-            Environment.GetEnvironmentVariable("WEBRTC_FFMPEG_DIR"),
-            Environment.GetEnvironmentVariable("WEBRTC_FFMPEG_PATH"),
-            Environment.GetEnvironmentVariable("FFMPEG_BIN_PATH"),
-            Environment.GetEnvironmentVariable("FFMPEG_DIR"),
-            Environment.GetEnvironmentVariable("FFMPEG_ROOT")
+            else if (state == RTCPeerConnectionState.connected)
+            {
+                await audioSource.StartAudio();
+                await testPatternSource.StartVideo();
+            }
         };
 
-        foreach (var candidate in envCandidates)
+        // Diagnostics.
+        //pc.OnReceiveReport += (re, media, rr) => logger.LogDebug($"RTCP Receive for {media} from {re}\n{rr.GetDebugSummary()}");
+        //pc.OnSendReport += (media, sr) => logger.LogDebug($"RTCP Send for {media}\n{sr.GetDebugSummary()}");
+        //pc.GetRtpChannel().OnStunMessageReceived += (msg, ep, isRelay) => logger.LogDebug($"STUN {msg.Header.MessageType} received from {ep}.");
+        pc.oniceconnectionstatechange += (state) => _logger.LogDebug($"ICE connection state change to {state}.");
+        pc.onsignalingstatechange += () =>
         {
-            if (string.IsNullOrWhiteSpace(candidate))
+            if (pc.signalingState == RTCSignalingState.have_local_offer)
             {
-                continue;
+                _logger.LogDebug($"Local SDP set, type {pc.localDescription.type}.");
+                _logger.LogDebug(pc.localDescription.sdp.ToString());
             }
-
-            var expanded = Environment.ExpandEnvironmentVariables(candidate);
-            if (Directory.Exists(expanded))
+            else if (pc.signalingState == RTCSignalingState.have_remote_offer)
             {
-                return Path.GetFullPath(expanded);
+                _logger.LogDebug($"Remote SDP set, type {pc.remoteDescription.type}.");
+                _logger.LogDebug(pc.remoteDescription.sdp.ToString());
             }
-        }
-
-        var pathEntries = (Environment.GetEnvironmentVariable("PATH") ?? string.Empty)
-            .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-
-        foreach (var entry in pathEntries)
-        {
-            try
-            {
-                if (!Directory.Exists(entry))
-                {
-                    continue;
-                }
-
-                if (Directory.EnumerateFiles(entry, "avcodec*.dll", SearchOption.TopDirectoryOnly).Any())
-                {
-                    return Path.GetFullPath(entry);
-                }
-            }
-            catch (Exception)
-            {
-            }
-        }
-
-        var searchRoots = new[]
-        {
-            Directory.GetCurrentDirectory(),
-            Directory.GetParent(Directory.GetCurrentDirectory())?.FullName,
-            Directory.GetParent(AppContext.BaseDirectory)?.FullName
         };
 
-        foreach (var root in searchRoots.Where(r => !string.IsNullOrWhiteSpace(r)))
+        return Task.FromResult(pc);
+    }
+
+    private static void MesasureTestPatternSourceFrameRate(uint durationMilliseconds, int width, int height, byte[] sample, VideoPixelFormatsEnum pixelFormat)
+    {
+        if (_startTime == DateTime.MinValue)
         {
-            try
-            {
-                foreach (var candidateDir in Directory.EnumerateDirectories(root!, "ffmpeg-*", SearchOption.TopDirectoryOnly))
-                {
-                    var binDir = Path.Combine(candidateDir, "bin");
-                    if (Directory.Exists(binDir) && Directory.EnumerateFiles(binDir, "avcodec*.dll", SearchOption.TopDirectoryOnly).Any())
-                    {
-                        return Path.GetFullPath(binDir);
-                    }
-                }
-            }
-            catch (Exception)
-            {
-            }
+            _startTime = DateTime.Now;
         }
 
-        return null;
+        _frameCount++;
+
+        if (DateTime.Now.Subtract(_startTime).TotalSeconds > 5)
+        {
+            double fps = _frameCount / DateTime.Now.Subtract(_startTime).TotalSeconds;
+            _logger.LogDebug($"Frame rate {fps:0.##}fps.");
+            _startTime = DateTime.Now;
+            _frameCount = 0;
+        }
+    }
+
+    /// <summary>
+    ///  Adds a console logger. Can be omitted if internal SIPSorcery debug and warning messages are not required.
+    /// </summary>
+    private static Microsoft.Extensions.Logging.ILogger AddConsoleLogger()
+    {
+        var seriLogger = new LoggerConfiguration()
+            .Enrich.FromLogContext()
+            .MinimumLevel.Is(Serilog.Events.LogEventLevel.Debug)
+            .WriteTo.Console()
+            .CreateLogger();
+        var factory = new SerilogLoggerFactory(seriLogger);
+        SIPSorcery.LogFactory.Set(factory);
+        return factory.CreateLogger<Program>();
     }
 }

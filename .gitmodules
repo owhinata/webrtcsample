@@ -1,0 +1,3 @@
+[submodule "VP8.Net"]
+	path = VP8.Net
+	url = https://github.com/sipsorcery-org/VP8.Net.git
