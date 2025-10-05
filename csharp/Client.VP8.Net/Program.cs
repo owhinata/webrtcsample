@@ -29,6 +29,10 @@ class Program
     private static bool framePending;
     private static bool firstFrameLogged;
 
+    private static int frameCount = 0;
+    private static DateTime startTime = DateTime.MinValue;
+    private static long totalBytes = 0;
+
     static void Main(string[] args)
     {
         Run();
@@ -163,11 +167,7 @@ class Program
 
         peerConnection.OnVideoFrameReceived += (rep, ts, frame, pixelFmt) =>
         {
-            logger.LogDebug(
-                "Video frame received {Length} bytes from {Remote}.",
-                frame.Length,
-                rep
-            );
+            totalBytes += frame.Length;
             videoEndPoint.GotVideoFrame(rep, ts, frame, pixelFmt);
         };
 
@@ -200,6 +200,32 @@ class Program
 
     private static void ProcessFastDecodedSample(RawImage rawImage)
     {
+        if (startTime == DateTime.MinValue)
+        {
+            startTime = DateTime.Now;
+        }
+
+        frameCount++;
+
+        if (DateTime.Now.Subtract(startTime).TotalSeconds >= 5)
+        {
+            double elapsedSeconds = DateTime.Now.Subtract(startTime).TotalSeconds;
+            double fps = frameCount / elapsedSeconds;
+            double throughputKbps = (totalBytes * 8) / (elapsedSeconds * 1000);
+            logger.LogDebug(
+                "Decoded fast frame format={Format} {Width}x{Height} stride={Stride}, Frame rate {Fps:0.##}fps, Throughput {Throughput:0.##}kbps.",
+                rawImage.PixelFormat,
+                rawImage.Width,
+                rawImage.Height,
+                rawImage.Stride,
+                fps,
+                throughputKbps
+            );
+            startTime = DateTime.Now;
+            frameCount = 0;
+            totalBytes = 0;
+        }
+
         var (buffer, width, height, matType, conversion) = ConvertRawImage(rawImage);
         if (buffer != null)
         {
@@ -215,15 +241,62 @@ class Program
         VideoPixelFormatsEnum pixelFormat
     )
     {
+        if (startTime == DateTime.MinValue)
+        {
+            startTime = DateTime.Now;
+        }
+
+        frameCount++;
+
+        bool shouldLog = DateTime.Now.Subtract(startTime).TotalSeconds >= 5;
+
+        if (shouldLog)
+        {
+            double elapsedSeconds = DateTime.Now.Subtract(startTime).TotalSeconds;
+            double fps = frameCount / elapsedSeconds;
+            double throughputKbps = (totalBytes * 8) / (elapsedSeconds * 1000);
+
+            switch (pixelFormat)
+            {
+                case VideoPixelFormatsEnum.Rgb:
+                    logger.LogDebug(
+                        "Decoded RGB frame {Width}x{Height} stride={Stride}, Frame rate {Fps:0.##}fps, Throughput {Throughput:0.##}kbps.",
+                        width,
+                        height,
+                        stride,
+                        fps,
+                        throughputKbps
+                    );
+                    break;
+
+                case VideoPixelFormatsEnum.Bgr:
+                    logger.LogDebug(
+                        "Decoded BGR frame {Width}x{Height} stride={Stride}, Frame rate {Fps:0.##}fps, Throughput {Throughput:0.##}kbps.",
+                        width,
+                        height,
+                        stride,
+                        fps,
+                        throughputKbps
+                    );
+                    break;
+
+                default:
+                    logger.LogWarning(
+                        "Unhandled decoded sample pixel format {PixelFormat} (stride={Stride}).",
+                        pixelFormat,
+                        stride
+                    );
+                    break;
+            }
+
+            startTime = DateTime.Now;
+            frameCount = 0;
+            totalBytes = 0;
+        }
+
         switch (pixelFormat)
         {
             case VideoPixelFormatsEnum.Rgb:
-                logger.LogDebug(
-                    "Decoded RGB frame {Width}x{Height} stride={Stride}.",
-                    width,
-                    height,
-                    stride
-                );
                 UpdateFrame(
                     buffer,
                     (int)width,
@@ -234,21 +307,7 @@ class Program
                 break;
 
             case VideoPixelFormatsEnum.Bgr:
-                logger.LogDebug(
-                    "Decoded BGR frame {Width}x{Height} stride={Stride}.",
-                    width,
-                    height,
-                    stride
-                );
                 UpdateFrame(buffer, (int)width, (int)height, MatType.CV_8UC3, null);
-                break;
-
-            default:
-                logger.LogWarning(
-                    "Unhandled decoded sample pixel format {PixelFormat} (stride={Stride}).",
-                    pixelFormat,
-                    stride
-                );
                 break;
         }
     }

@@ -35,6 +35,9 @@ class Program
     private static bool firstFrameLogged;
     private static FFmpegVideoEndPoint? videoEndPoint;
 
+    private static int frameCount = 0;
+    private static DateTime startTime = DateTime.MinValue;
+
     static async Task Main(string[] args)
     {
         await RunAsync().ConfigureAwait(false);
@@ -274,13 +277,27 @@ class Program
 
     private static void ProcessFastDecodedSample(RawImage rawImage)
     {
-        logger.LogDebug(
-            "Decoded fast frame format={Format} {Width}x{Height} stride={Stride}.",
-            rawImage.PixelFormat,
-            rawImage.Width,
-            rawImage.Height,
-            rawImage.Stride
-        );
+        if (startTime == DateTime.MinValue)
+        {
+            startTime = DateTime.Now;
+        }
+
+        frameCount++;
+
+        if (DateTime.Now.Subtract(startTime).TotalSeconds >= 5)
+        {
+            double fps = frameCount / DateTime.Now.Subtract(startTime).TotalSeconds;
+            logger.LogDebug(
+                "Decoded fast frame format={Format} {Width}x{Height} stride={Stride}, Frame rate {Fps:0.##}fps.",
+                rawImage.PixelFormat,
+                rawImage.Width,
+                rawImage.Height,
+                rawImage.Stride,
+                fps
+            );
+            startTime = DateTime.Now;
+            frameCount = 0;
+        }
 
         var (buffer, width, height, matType, conversion) = ConvertRawImage(rawImage);
         if (buffer != null)
@@ -297,15 +314,57 @@ class Program
         VideoPixelFormatsEnum pixelFormat
     )
     {
+        if (startTime == DateTime.MinValue)
+        {
+            startTime = DateTime.Now;
+        }
+
+        frameCount++;
+
+        bool shouldLog = DateTime.Now.Subtract(startTime).TotalSeconds >= 5;
+
+        if (shouldLog)
+        {
+            double fps = frameCount / DateTime.Now.Subtract(startTime).TotalSeconds;
+
+            switch (pixelFormat)
+            {
+                case VideoPixelFormatsEnum.Rgb:
+                    logger.LogDebug(
+                        "Decoded RGB frame {Width}x{Height} stride={Stride}, Frame rate {Fps:0.##}fps.",
+                        width,
+                        height,
+                        stride,
+                        fps
+                    );
+                    break;
+
+                case VideoPixelFormatsEnum.Bgr:
+                    logger.LogDebug(
+                        "Decoded BGR frame {Width}x{Height} stride={Stride}, Frame rate {Fps:0.##}fps.",
+                        width,
+                        height,
+                        stride,
+                        fps
+                    );
+                    break;
+
+                default:
+                    logger.LogWarning(
+                        "Unhandled decoded sample pixel format {PixelFormat} (stride={Stride}).",
+                        pixelFormat,
+                        stride
+                    );
+                    break;
+            }
+
+            startTime = DateTime.Now;
+            frameCount = 0;
+        }
+
         switch (pixelFormat)
         {
             case VideoPixelFormatsEnum.Rgb:
-                logger.LogDebug(
-                    "Decoded RGB frame {Width}x{Height} stride={Stride}.",
-                    width,
-                    height,
-                    stride
-                );
                 UpdateFrame(
                     buffer,
                     (int)width,
@@ -316,21 +375,7 @@ class Program
                 break;
 
             case VideoPixelFormatsEnum.Bgr:
-                logger.LogDebug(
-                    "Decoded BGR frame {Width}x{Height} stride={Stride}.",
-                    width,
-                    height,
-                    stride
-                );
                 UpdateFrame(buffer, (int)width, (int)height, MatType.CV_8UC3, null);
-                break;
-
-            default:
-                logger.LogWarning(
-                    "Unhandled decoded sample pixel format {PixelFormat} (stride={Stride}).",
-                    pixelFormat,
-                    stride
-                );
                 break;
         }
     }
